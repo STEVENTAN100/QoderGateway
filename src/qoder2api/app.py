@@ -1,0 +1,569 @@
+import argparse
+import collections
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from .auth import SessionContext, create_session, load_local_session
+from .bridge import complete_openai_response, stream_openai_response
+from .config import load_config, save_config
+from .database import get_db
+from .env import env_bool
+from .accounts import (
+    db_load_accounts,
+    db_get_settings,
+    db_set_settings,
+    import_current_auth,
+    get_active_session,
+    rotate_next_account,
+    batch_import_accounts,
+)
+from .registrar import get_registrar_status, start_registration, stop_registration
+from .tokens import (
+    refresh_all_account_tokens,
+    refresh_one_account,
+    get_account_quota,
+    get_all_accounts_quota,
+    start_refresh_loop,
+)
+
+BASE_DIR = os.path.dirname(__file__)
+INDEX_HTML = Path(BASE_DIR) / "static" / "index.html"
+CONSOLE_HTML = Path(BASE_DIR) / "static" / "console.html"
+DOCS_HTML = Path(BASE_DIR) / "static" / "docs.html"
+
+app = FastAPI(title="qoder2api-python")
+app.mount("/assets", StaticFiles(directory=os.path.join(BASE_DIR, "static", "assets")), name="assets")
+
+_session: SessionContext | None = None
+_local_auth_error: str | None = None
+
+logs_queue = collections.deque(maxlen=150)
+
+
+def add_log(msg: str, level: str = "INFO") -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    formatted = f"[{timestamp}] [{level}] {msg}"
+    logs_queue.append(formatted)
+    print(formatted)
+
+
+# Add initial logs
+add_log("Qoder2API Python Bridge initialized.")
+
+
+
+def check_gateway_token(x_gateway_token: str | None = Header(default=None)):
+    config = load_config()
+    gateway_token = config.get("gateway_token", "admin")
+    if not x_gateway_token or x_gateway_token != gateway_token:
+        raise HTTPException(status_code=401, detail="Unauthorized gateway access")
+
+
+@app.post("/ui/verify")
+async def verify_gateway(payload: dict[str, Any]) -> dict[str, Any]:
+    token = payload.get("token", "").strip()
+    config = load_config()
+    if token == config.get("gateway_token", "admin"):
+        return {"status": "ok"}
+    raise HTTPException(status_code=401, detail="Invalid Gateway Token")
+
+
+async def get_session() -> SessionContext:
+    global _local_auth_error
+    data = db_load_accounts()
+    if not data["accounts"]:
+        # Try importing environment PAT if available
+        pat = os.getenv("QODER_PAT", "").strip()
+        if pat:
+            add_log("No accounts stored. Importing QODER_PAT from environment...")
+            try:
+                sess = await create_session(pat)
+                with get_db() as conn:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO accounts (
+                            uid, name, user_type, security_oauth_token, refresh_token, machine_id,
+                            enabled, last_status, last_error
+                        ) VALUES (?, ?, ?, ?, ?, ?, 1, 'ok', NULL)
+                        """,
+                        (sess.identity.uid, sess.identity.name or "Environment PAT", sess.identity.user_type,
+                         sess.identity.security_oauth_token, sess.identity.refresh_token, sess.machine_id)
+                    )
+                db_set_settings("active_uid", sess.identity.uid)
+                add_log(f"Imported environment PAT as account: {sess.identity.name}")
+                _local_auth_error = None
+            except Exception as exc:
+                add_log(f"Failed to import environment PAT: {exc}", "ERROR")
+
+        data = db_load_accounts()
+        if not data["accounts"]:
+            add_log("No accounts stored. Attempting to auto-import current local Qoder auth session...")
+            try:
+                await import_current_auth()
+                add_log("Auto-imported current local Qoder session successfully.")
+                _local_auth_error = None
+            except Exception as exc:
+                _local_auth_error = str(exc)
+                add_log(f"Auto-import of local session failed: {exc}", "WARNING")
+
+    try:
+        return get_active_session()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No active session available: {exc}. Please configure/import an account first."
+        )
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> HTMLResponse:
+    if not env_bool("QODER_ENABLE_LANDING", True):
+        raise HTTPException(status_code=404, detail="Landing page is disabled")
+    return HTMLResponse(INDEX_HTML.read_text(encoding="utf-8"))
+
+
+@app.get("/console", response_class=HTMLResponse)
+async def console() -> HTMLResponse:
+    return HTMLResponse(CONSOLE_HTML.read_text(encoding="utf-8"))
+
+
+@app.get("/documents", response_class=HTMLResponse)
+async def documents() -> HTMLResponse:
+    if not env_bool("QODER_ENABLE_DOCUMENTS", True):
+        raise HTTPException(status_code=404, detail="Documents page is disabled")
+    return HTMLResponse(DOCS_HTML.read_text(encoding="utf-8"))
+
+
+@app.get("/ui/status")
+async def status(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    global _local_auth_error
+    try:
+        await get_session()
+    except Exception:
+        pass
+
+    data = db_load_accounts()
+    active_uid = data.get("active_uid")
+    active_acc = None
+    for acc in data["accounts"]:
+        if acc["uid"] == active_uid:
+            active_acc = acc
+            break
+
+    if active_acc is not None:
+        return {
+            "ready": True,
+            "mode": "accounts",
+            "username": active_acc["name"],
+            "uid": active_acc["uid"],
+            "user_type": active_acc["user_type"],
+            "error": None,
+            "accounts_count": len(data["accounts"])
+        }
+    return {
+        "ready": False,
+        "mode": "none",
+        "username": None,
+        "uid": None,
+        "user_type": None,
+        "error": _local_auth_error,
+        "accounts_count": len(data["accounts"])
+    }
+
+
+@app.get("/ui/accounts")
+async def get_accounts(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    return db_load_accounts()
+
+
+@app.post("/ui/accounts/import")
+async def import_account(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    try:
+        acc = await import_current_auth()
+        add_log(f"Imported local Qoder session account: {acc['name']}")
+        return {"status": "ok", "account": acc}
+    except Exception as exc:
+        add_log(f"Failed to import local session account: {exc}", "ERROR")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/ui/accounts/batch-import")
+async def batch_import(payload: dict[str, Any], verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """批量导入注册机导出的 JSON：{"accounts": [{user_id, token, refresh_token, ...}]}。"""
+    records = payload.get("accounts") or payload.get("records") or []
+    if not isinstance(records, list) or not records:
+        raise HTTPException(status_code=400, detail="accounts 数组为空")
+    result = batch_import_accounts(records)
+    add_log(f"Batch imported {result['imported']} accounts (skipped {result['skipped']})")
+    return {"status": "ok", **result}
+
+
+@app.post("/ui/accounts/select")
+async def select_account(payload: dict[str, Any], verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    uid = payload.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid is required")
+    with get_db() as conn:
+        res = conn.execute("SELECT uid FROM accounts WHERE uid = ?", (uid,)).fetchone()
+        if not res:
+            raise HTTPException(status_code=404, detail="Account not found")
+    db_set_settings("active_uid", uid)
+    add_log(f"Selected active account UID: {uid}")
+    return {"status": "ok"}
+
+
+@app.post("/ui/accounts/toggle")
+async def toggle_account(payload: dict[str, Any], verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    uid = payload.get("uid")
+    enabled = bool(payload.get("enabled", True))
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid is required")
+    enabled_val = 1 if enabled else 0
+    with get_db() as conn:
+        res = conn.execute("UPDATE accounts SET enabled = ? WHERE uid = ?", (enabled_val, uid))
+        if res.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Account not found")
+    add_log(f"Account toggle enabled={enabled} for UID: {uid}")
+    return {"status": "ok"}
+
+
+@app.post("/ui/accounts/refresh-tokens")
+async def refresh_account_tokens(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """手动触发：刷新所有账号的 token（drt- → deviceToken/refresh）。"""
+    result = refresh_all_account_tokens()
+    add_log(f"Token refresh: ok={result['ok']} failed={result['failed']} total={result['total']}")
+    return {"status": "ok", **result}
+
+
+@app.get("/ui/accounts/quota")
+async def accounts_quota(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """查看所有启用账号的限额（GET /api/v2/quota/usage）。"""
+    return get_all_accounts_quota()
+
+
+@app.delete("/ui/accounts/{uid}")
+async def delete_account(uid: str, verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    with get_db() as conn:
+        res = conn.execute("DELETE FROM accounts WHERE uid = ?", (uid,))
+        if res.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Account not found")
+            
+    active_uid = db_get_settings("active_uid")
+    if active_uid == uid:
+        data = db_load_accounts()
+        new_active = data["accounts"][0]["uid"] if data["accounts"] else None
+        if new_active:
+            db_set_settings("active_uid", new_active)
+        else:
+            with get_db() as conn:
+                conn.execute("DELETE FROM settings WHERE key = 'active_uid'")
+    add_log(f"Deleted account UID: {uid}")
+    return {"status": "ok"}
+
+
+@app.get("/ui/logs")
+async def get_logs(verify: None = Depends(check_gateway_token)) -> list[str]:
+    return list(logs_queue)
+
+
+@app.post("/ui/registrar/start")
+async def registrar_start(payload: dict[str, Any] | None = None, verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """启动注册机（无限循环：parents 个母线程 × 每批 3 个子任务，直到调用 stop）。
+
+    body 可选：{"parents": 2}  —— 母线程数（1-6），每母线程 3 子任务并发。
+    """
+    payload = payload or {}
+    try:
+        parents = int(payload.get("parents", 2))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="parents 参数无效")
+    return start_registration(parents=parents)
+
+
+@app.post("/ui/registrar/stop")
+async def registrar_stop(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """请求停止：当前批次完成后停止，返回本次注册统计。"""
+    return stop_registration()
+
+
+@app.get("/ui/registrar/status")
+async def registrar_status(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """查询注册机任务状态（stage / logs / result）。"""
+    return get_registrar_status()
+
+
+@app.get("/ui/config")
+async def get_ui_config(verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    return load_config()
+
+
+@app.post("/ui/config")
+async def post_ui_config(payload: dict[str, Any], verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    save_config(payload)
+    add_log("API Key configuration updated.")
+    return {"status": "ok"}
+
+
+@app.post("/ui/session")
+async def set_session(payload: dict[str, Any], verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    global _local_auth_error
+    pat = str(payload.get("pat") or os.getenv("QODER_PAT", "")).strip()
+    if not pat:
+        raise HTTPException(status_code=400, detail="PAT is required")
+    try:
+        add_log("Attempting to save session from PAT...")
+        sess = await create_session(pat)
+        
+        # Insert or update in SQLite
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO accounts (
+                    uid, name, user_type, security_oauth_token, refresh_token, machine_id,
+                    enabled, last_status, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, 'ok', ?)
+                """,
+                (sess.identity.uid, sess.identity.name or "PAT Account", sess.identity.user_type,
+                 sess.identity.security_oauth_token, sess.identity.refresh_token, sess.machine_id, None)
+            )
+            
+        db_set_settings("active_uid", sess.identity.uid)
+        
+        add_log(f"Session saved from PAT. User: {sess.identity.name}")
+        _local_auth_error = None
+        return {"ready": True, "id": sess.identity.uid, "name": sess.identity.name, "user_type": sess.identity.user_type}
+    except Exception as exc:
+        msg = f"Failed to authenticate with provided PAT: {exc}"
+        add_log(msg, "ERROR")
+        raise HTTPException(status_code=502, detail=msg) from exc
+
+
+def is_quota_error(exc: Exception) -> bool:
+    """判断是否为 quota/限流类错误（429 / quota / rate limit）。
+    这类错误需先查询真实限额确认，不能直接跳过账户。"""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        return any(k in msg for k in ("http 429", "quota", "rate limit", "insufficient"))
+    return False
+
+
+def is_account_error(exc: Exception) -> bool:
+    """判断是否'账号级'错误（token 无效/限额/服务端拒绝）。只有这类才应跳过账户。
+
+    网络/流中断/超时（如 httpx.ReadError 的 incomplete chunk read）是临时性问题，
+    换账户也无效，不应触发 rotate。
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (401, 403, 429)
+    if isinstance(exc, httpx.HTTPError):
+        return False  # 连接/超时/读错误等网络问题
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        if any(code in msg for code in ("http 401", "http 403", "http 429")):
+            return True
+        for kw in ("unauthorized", "invalid token", "quota", "rate limit",
+                   "insufficient", "personal token", "credit"):
+            if kw in msg:
+                return True
+    return False
+
+
+# cloud/models 仅认 PAT（pt-），会话 token 无效；不可用时回退此静态清单
+SUPPORTED_MODELS = [
+    {"id": "auto", "display_name": "Auto"},
+    {"id": "fast", "display_name": "Fast"},
+    {"id": "qmodel_38max", "display_name": "Qwen3.8-Max"},
+    {"id": "qfmodel", "display_name": "Qwen3.8-Flash"},
+    {"id": "qmodel_latest", "display_name": "Qwen3.7-Max"},
+    {"id": "qmodel", "display_name": "Qwen3.7-Plus"},
+    {"id": "q37fmodel", "display_name": "Qwen3.7-Flash"},
+    {"id": "dmodel", "display_name": "DeepSeek-V4-Pro"},
+    {"id": "dfmodel", "display_name": "DeepSeek-Flash"},
+    {"id": "gmodel", "display_name": "GLM-5.3"},
+    {"id": "gfmodel", "display_name": "GLM-5.3-Flash"},
+    {"id": "gm51model", "display_name": "GLM-5.2"},
+    {"id": "kmodel_latest", "display_name": "Kimi-K3"},
+    {"id": "kmodel", "display_name": "Kimi-K2.8-Preview"},
+    {"id": "mmodel", "display_name": "MiniMax-M2.7"},
+]
+
+_models_cache: dict[str, Any] = {"data": None, "ts": 0.0}
+
+
+def _merge_efforts(efforts: list[str]) -> list[str]:
+    """上游元数据可能缺实测可用的档位（gfmodel 实测支持 xhigh 但元数据未列），补全并按思考深度排序。"""
+    known = ["low", "medium", "high", "xhigh", "max"]
+    merged = set(efforts) & set(known) | {"low", "xhigh"} if efforts else set(efforts) & set(known)
+    return [e for e in known if e in merged]
+
+
+async def fetch_cloud_models() -> list[dict[str, Any]] | None:
+    """从 api.qoder.com.cn/api/v1/cloud/models 动态拉模型目录（需 PAT）。缓存 10 分钟。"""
+    import time as _time
+    now = _time.time()
+    if _models_cache["data"] and now - _models_cache["ts"] < 600:
+        return _models_cache["data"]
+    pat = os.getenv("QODER_PAT", "").strip()
+    if not pat:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://api.qoder.com.cn/api/v1/cloud/models",
+                headers={"Authorization": f"Bearer {pat}", "Accept": "application/json"},
+            )
+        if r.status_code != 200:
+            return None
+        items = r.json().get("data") or []
+        models = [
+            {
+                "id": m["id"],
+                "display_name": m.get("display_name") or m["id"],
+                "efforts": _merge_efforts(m.get("efforts") or []),
+                "default_effort": m.get("default_effort") or "",
+                "support_disable_reasoning": m.get("support_disable_reasoning", True),
+            }
+            for m in items
+            if m.get("is_enabled", True)
+        ]
+        _models_cache.update({"data": models, "ts": now})
+        return models
+    except Exception:
+        return None
+
+
+async def normalize_reasoning_effort(payload: dict[str, Any]) -> None:
+    """按模型能力校正 reasoning_effort（如 GLM-5.3-Flash 不支持 none，传 none 会被上游 1210 拒绝）。"""
+    models = await fetch_cloud_models()
+    if not models:
+        return
+    info = next((m for m in models if m["id"] == payload.get("model")), None)
+    if not info:
+        return
+    effort = str(payload.get("reasoning_effort") or "none").strip().lower()
+    # 上游元数据的 efforts 不可信（gfmodel 声称 [max,high]，实测仅 low 放行）；low 是全模型实测通用档位
+    if info["efforts"] and effort not in info["efforts"] or not info["support_disable_reasoning"] and effort == "none":
+        payload["reasoning_effort"] = "low"
+
+
+@app.get("/v1/models")
+async def list_models(authorization: str | None = Header(default=None)):
+    config = load_config()
+    if config.get("auth_required", False):
+        incoming_key = authorization[len("Bearer "):].strip() if authorization and authorization.startswith("Bearer ") else None
+        if not incoming_key or incoming_key not in config.get("allowed_keys", []):
+            raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    models = await fetch_cloud_models() or SUPPORTED_MODELS
+    return {
+        "object": "list",
+        "data": [
+            {"id": m["id"], "object": "model", "owned_by": "qoder", "display_name": m["display_name"]}
+            for m in models
+        ],
+    }
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(payload: dict[str, Any], authorization: str | None = Header(default=None)):
+    config = load_config()
+    if config.get("auth_required", False):
+        allowed_keys = config.get("allowed_keys", [])
+        incoming_key = None
+        if authorization and authorization.startswith("Bearer "):
+            incoming_key = authorization[len("Bearer "):].strip()
+        
+        if not incoming_key or incoming_key not in allowed_keys:
+            add_log("Access denied: Invalid or missing API Key in request header.", "WARNING")
+            raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+    model = payload.get("model", "lite")
+    stream = bool(payload.get("stream", False))
+    messages_count = len(payload.get("messages", []))
+    await normalize_reasoning_effort(payload)
+    add_log(f"Incoming completion request: model={model}, stream={stream}, messages={messages_count}")
+    
+    accounts_data = db_load_accounts()
+    enabled_count = sum(1 for acc in accounts_data["accounts"] if acc.get("enabled", True))
+    max_retries = max(1, enabled_count)
+    
+    for attempt in range(max_retries):
+        try:
+            sess = await get_session()
+            add_log(f"Request routing via account: {sess.identity.name} ({sess.identity.uid})")
+            if stream:
+                gen = stream_openai_response(payload, sess)
+                try:
+                    first_item = await gen.__anext__()
+                except StopAsyncIteration:
+                    first_item = None
+                
+                async def stream_success_wrapper(first, g):
+                    if first is not None:
+                        yield first
+                    async for chunk in g:
+                        yield chunk
+                
+                add_log(f"Streaming response initiated (Attempt {attempt+1}/{max_retries}).")
+                return StreamingResponse(
+                    stream_success_wrapper(first_item, gen),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache"}
+                )
+            else:
+                add_log(f"Generating full completion response (Attempt {attempt+1}/{max_retries})...")
+                resp = await complete_openai_response(payload, sess)
+                add_log("Completion request finished successfully.")
+                return resp
+        except Exception as exc:
+            current_uid = sess.identity.uid if 'sess' in locals() else "unknown"
+            if is_account_error(exc):
+                if is_quota_error(exc):
+                    # quota 类错误：先发一次请求确认是否真正 exceeded，而不是直接跳过
+                    q = get_account_quota(current_uid)
+                    if q.get("ok"):
+                        quota = q["quota"]
+                        truly_exceeded = bool(quota.get("isQuotaExceeded")) or (quota.get("userQuota") or {}).get("remaining", 1) <= 0
+                        if not truly_exceeded:
+                            add_log(f"Quota check on {current_uid}: NOT exceeded (remaining={quota.get('userQuota', {}).get('remaining')}), not rotating.", "WARNING")
+                            raise HTTPException(status_code=502, detail=f"{exc}")
+                        add_log(f"Quota confirmed exceeded for {current_uid}: {exc}. Rotating...", "WARNING")
+                    else:
+                        # 限额查询失败：无法确认，保守不跳过账户
+                        add_log(f"Quota check failed for {current_uid} ({q.get('error')}), not rotating.", "WARNING")
+                        raise HTTPException(status_code=502, detail=f"{exc}")
+                else:
+                    add_log(f"Account-level error on {current_uid}: {exc}. Rotating to next account...", "WARNING")
+                try:
+                    rotate_next_account(current_uid, str(exc))
+                except Exception as e:
+                    add_log(f"Failed to rotate account: {e}", "ERROR")
+                    raise HTTPException(status_code=502, detail=f"Request failed and no other account is available. Error: {exc}")
+            else:
+                add_log(f"Transient error on account {current_uid}: {exc}. Not rotating account.", "WARNING")
+                raise HTTPException(status_code=502, detail=str(exc))
+                
+    raise HTTPException(status_code=502, detail="Request failed on all available accounts.")
+
+
+def main() -> None:
+    import uvicorn
+
+    start_refresh_loop()  # 启动 token 定时刷新线程（每 6 小时）
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default=os.getenv("QODER_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("QODER_PORT", "5050")))
+    args = parser.parse_args()
+    uvicorn.run("qoder2api.app:app", host=args.host, port=args.port, reload=False)
+
+if __name__ == "__main__":
+    main()
