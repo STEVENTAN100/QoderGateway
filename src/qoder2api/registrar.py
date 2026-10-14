@@ -219,7 +219,7 @@ def yyds_wait_code(address: str, task_id: str | None = None, timeout: float = 12
 
 
 # ---------------------------------------------------------------------------
-# Device flow（来自 qodercli 逆向：docs/qoder-protocol-research.md §4）
+# Device flow
 # ---------------------------------------------------------------------------
 def device_flow_params(machine_id: str | None = None) -> dict:
     length = random.randint(43, 128)
@@ -254,7 +254,7 @@ def poll_device_token(poll_url: str, task_id: str | None = None, timeout: float 
 
 
 # ---------------------------------------------------------------------------
-# 按钮识别（规则来自 scripts/buttons_dump.json 实测：button + '继 续' + ant-btn-primary）
+# 按钮识别：button + '继 续' + ant-btn-primary
 # ---------------------------------------------------------------------------
 def _normalize_text(text: Any) -> str:
     return (text or "").replace("\u00a0", " ").replace(" ", "").replace("\n", "").replace("\r", "").strip().lower()

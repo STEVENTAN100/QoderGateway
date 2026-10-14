@@ -189,16 +189,6 @@ Chat Completions 的 `reasoning_effort` 和 Responses 的 `reasoning.effort` 会
 
 日志只保存工具名称/类型、声明位置、消息角色、字符长度、思考强度和响应状态；`input_agent_messages` 记录代理消息的位置、发送者/接收者标识、内容类型、字符长度及 `encrypted_parts_omitted` 计数。不保存提示词正文、代理消息正文、密文、思考文本、工具参数值或认证头。排查时应将这些元数据与客户端执行结果对应；HTTP 200 和工具调用事件本身不能证明本地命令已成功执行。
 
-### 离线回归验证
-
-安装依赖后，在项目根目录执行：
-
-```bash
-uv run python -m unittest discover -s tests -v
-```
-
-这组测试使用模拟上游事件，不访问 Qoder，不执行模型生成的工具，也不读写账号数据库。
-
 ## 查询模型与更新清单 / Models
 
 使用 **Qoder CN 版 PAT** 查询当前账号可见的云端模型 ID、显示名称及相关能力信息。下面的 `QODER_ACCESS_TOKEN` 变量应保存 CN PAT；不要把真实 Token 写进 README 或提交到 Git。它与本地网关的外部 API Key 是两种不同凭据。
@@ -291,7 +281,6 @@ curl.exe -X GET "https://api.qoder.com.cn/api/v1/cloud/models" `
 │   ├── src/landing-main.tsx# Landing Page
 │   └── src/docs/           # 中英文 Markdown 文档
 ├── .env.example            # 环境变量模板
-├── tests/                  # 无需上游凭据的转换回归测试
 └── pyproject.toml          # 项目配置
 ```
 
