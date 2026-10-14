@@ -43,7 +43,10 @@ This project is inspired by [cubk1/qoder2api](https://github.com/cubk1/qoder2api
 
 ## 功能 / Features
 
-- **OpenAI 兼容接口** — 通过 `/v1/chat/completions` 向客户端提供标准 Chat Completions API
+- **两种 API 接口** — `/v1/chat/completions` 提供 Chat Completions，`/v1/responses` 适配 Codex 常用的 Responses 文本与工具调用流程
+- **Codex 工具调用** — 保留 `function` / `custom` 自由文本工具及命名空间，支持 `additional_tools` 声明与多轮工具结果回传
+- **实际 token 用量与思考文本** — 传递上游 usage（含 reasoning / cached tokens），思考内容与最终答案分开返回
+- **思考强度原样传递** — `max` 等显式档位不自动降档，是否支持由上游模型决定
 - **多账号池** — 导入多个 Qoder 账号，按 UID 自动去重，请求失败时自动轮转
 - **两层鉴权** — 管理后台密钥与外部 API Key 分开配置
 - **SQLite 持久化** — 账号、API Key、全局配置全部存入本地数据库
@@ -96,6 +99,7 @@ uv run qoder2api
 | `/documents` | 文档站 / Wiki |
 | `/v1/models` | 模型 ID 与显示名称（优先云端目录，失败时使用静态清单） |
 | `/v1/chat/completions` | OpenAI 兼容 API |
+| `/v1/responses` | Responses 文本、工具调用及流式事件接口 |
 
 ### 第一次 API 调用 / First API Call
 
@@ -110,6 +114,88 @@ curl http://127.0.0.1:5050/v1/chat/completions \
     "stream": false
   }'
 ```
+
+## Responses 与 Codex 接入
+
+本仓库提供原生接入路径 `POST /v1/responses`，内部适配 Qoder CN 的聊天协议。推荐将 Codex 或中转服务的供应商协议设置为 **Responses**，Base URL 填写 `http://127.0.0.1:5050/v1`（远程部署时替换为自己的网关地址），模型使用 `gfmodel`、`gmodel` 等 Qoder 模型 ID，API Key 使用网关管理后台配置的外部 Key，不能将 CN PAT 当成网关 Key。
+
+连接路径应保持为 `/v1/responses`，避免在网关之前再次转换为 Chat Completions；仅切换供应商名称不会改变协议。直接使用 Codex 时，可参考以下配置：
+
+```toml
+model_provider = "qoder"
+model = "gfmodel"
+model_reasoning_effort = "max"
+web_search = "disabled"
+
+[model_providers.qoder]
+name = "QoderGateway CN"
+base_url = "http://127.0.0.1:5050/v1"
+wire_api = "responses"
+env_key = "QODER_GATEWAY_API_KEY"
+```
+
+在启动 Codex 的环境中设置 `QODER_GATEWAY_API_KEY` 为自己的网关 Key。保持原有文件权限、审批和沙箱设置；网关只返回工具调用，本地执行权限仍由客户端控制。这里关闭内置 `web_search`，因为当前网关没有实现该工具类型。
+
+### Responses 请求示例
+
+```bash
+curl http://127.0.0.1:5050/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $QODER_GATEWAY_API_KEY" \
+  -d '{
+    "model": "gfmodel",
+    "input": "有3个红球、2个蓝球，至少抽几个才能保证抽到红球？",
+    "reasoning": {"effort": "max"},
+    "store": false,
+    "stream": true
+  }'
+```
+
+非流式响应的 `output` 包含消息、思考摘要及工具调用，顶层 `usage` 使用 `input_tokens`、`output_tokens`、`total_tokens`，以及 `input_tokens_details.cached_tokens`、`output_tokens_details.reasoning_tokens` 等上游提供的详情。流式响应返回 `response.created`、输出项与文本/思考增量、工具输入事件，最后以 `response.completed`、`response.incomplete` 或 `response.failed` 结束。
+
+工具适配支持 `function`、`custom` 自由文本工具和 `namespace`：`functions.exec`、`functions.apply_patch` 等自由文本输入会恢复为 `custom_tool_call`，保留 `name`、`namespace` 和 `call_id`，后续接收 `custom_tool_call_output`。工具可在顶层 `tools` 中声明，也可由 `input` 中的 `additional_tools` 提供；重复历史声明会合并，并采用同名工具的最新定义。`configuration_update` 中的思考配置和客户端已经执行的 `tool_search_output` 中的工具声明也会处理。
+
+### Chat Completions 的 usage 与思考文本
+
+原 `/v1/chat/completions` 接口继续可用。非流式回答和思考文本分别位于 `choices[0].message.content`、`choices[0].message.reasoning_content`，实际计数位于顶层 `usage`。流式思考文本位于 `choices[0].delta.reasoning_content`；如需流式 usage，在请求中添加：
+
+```json
+{
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}
+```
+
+网关会在 `[DONE]` 前发送一个 `choices: []` 的 usage chunk。`completion_tokens` 已包含思考 token，不再额外相加；累计 usage 快照不会重复累加，上游未提供计数时不伪造全零值。`reasoning_content` 是兼容扩展字段，客户端需支持它；Responses 则将上游思考文本作为 reasoning summary 返回，不伪造 OpenAI 的加密思考状态。
+
+Chat Completions 的 `reasoning_effort` 和 Responses 的 `reasoning.effort` 会原样传递，`max` 不会自动改成 `xhigh`、`none` 或 `low`。显式请求参数优先于历史配置；没有提供该字段时沿用默认 `none`，不支持关闭思考的模型应显式选择可用档位。上游可能拒绝某档，或让不同档位产生相近的实际 token 数。Sub2API 等中转的日志标签也可能按模型名称归类，判断实际参数请核对网关入站和上游请求日志。
+
+### 当前兼容范围
+
+这是面向文本与工具调用的 Responses 适配，不是完整的 OpenAI 平台实现：
+
+- 使用 `store=false` 并在 `input` 中传递完整对话历史；不支持 `previous_response_id`、服务端历史查询/删除、后台响应和服务端 compaction。
+- 不支持原生 `web_search`、图像/文件输入、服务端执行的 `tool_search` 或结构化 JSON 输出；不支持的类型会明确返回 `400`。客户端已执行工具搜索后的工具声明可以读取。
+- 自由文本工具的 grammar 会加入工具说明；上游没有原生语法约束采样保证。工具输入需要等 JSON 参数完整后再解码，长代码的工具调用可能延后出现。
+- 客户端工具说明、模型生成代码与本地权限仍影响实际执行。模型传错参数类型或本地策略拒绝执行，与网关是否保留工具入口需要分别判断。
+
+实际验证覆盖 Codex 0.159.2 的自由文本执行入口、`additional_tools`、流式/非流式和多轮工具结果；离线测试覆盖关键转换边界。
+
+### 工具诊断日志
+
+两种 API 请求都带有 `X-Qoder-Trace-Id` 响应头。默认诊断日志位于运行用户的 `~/.qoder/diagnostics/tool-trace.jsonl`，按 5 MiB 轮转并保留 3 个备份，关联客户端请求、上游请求、上游响应和客户端响应。
+
+日志只保存工具名称/类型、声明位置、消息角色、字符长度、思考强度和响应状态，不保存提示词正文、思考文本、工具参数值或认证头。排查时应将这些元数据与客户端执行结果对应；HTTP 200 和工具调用事件本身不能证明本地命令已成功执行。
+
+### 离线回归验证
+
+安装依赖后，在项目根目录执行：
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+这组测试使用模拟上游事件，不访问 Qoder，不执行模型生成的工具，也不读写账号数据库。
 
 ## 查询模型与更新清单 / Models
 
@@ -191,6 +277,8 @@ curl.exe -X GET "https://api.qoder.com.cn/api/v1/cloud/models" `
 │   ├── accounts.py         # SQLite 账号管理
 │   ├── auth.py             # Qoder 鉴权与签名
 │   ├── bridge.py           # OpenAI 兼容响应转换
+│   ├── responses_api.py    # Responses 请求、事件、工具与 usage 适配
+│   ├── diagnostics.py      # 请求链路工具元数据日志
 │   ├── config.py           # 配置读写
 │   ├── database.py         # SQLite schema
 │   ├── env.py              # 环境变量加载
@@ -201,6 +289,7 @@ curl.exe -X GET "https://api.qoder.com.cn/api/v1/cloud/models" `
 │   ├── src/landing-main.tsx# Landing Page
 │   └── src/docs/           # 中英文 Markdown 文档
 ├── .env.example            # 环境变量模板
+├── tests/                  # 无需上游凭据的转换回归测试
 └── pyproject.toml          # 项目配置
 ```
 

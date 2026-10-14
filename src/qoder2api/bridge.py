@@ -11,6 +11,7 @@ import httpx
 from . import encoding
 from .auth import SessionContext, bearer_headers
 from .env import httpx_client_kwargs
+from .diagnostics import emit, tool_metadata, ResponseSummary
 
 
 QODER_CHAT_URL = "https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
@@ -256,12 +257,14 @@ def build_qoder_body(req: dict[str, Any], sess: SessionContext) -> tuple[dict[st
     prompt = extract_latest_user_prompt(messages)
     body["chat_context"]["text"]["text"] = prompt
     body["chat_context"]["extra"]["originalContent"]["text"] = prompt
-    # CN 上游无视 is_reasoning，真正控制思维链的是 parameters.reasoning_effort
-    # （实测 kmodel_latest：none → 0 reasoning 块、首 token 13.5s→4.7s；low/medium/high 保留思考）
-    effort = str(req.get("reasoning_effort") or "none").strip().lower()
-    if effort not in ("none", "minimal", "low", "medium", "high", "xhigh"):
-        effort = "none"
-    body["parameters"] = {"max_tokens": 32768, "reasoning_effort": effort}
+    # Preserve the caller's reasoning_effort; upstream validates model support.
+    # Keep the existing default only when the field is omitted.
+    body["parameters"] = {"max_tokens": 32768, "reasoning_effort": req.get("reasoning_effort", "none")}
+    if "max_tokens" in req:
+        body["parameters"]["max_tokens"] = req["max_tokens"]
+    for option in ("tool_choice", "parallel_tool_calls"):
+        if option in req:
+            body[option] = copy.deepcopy(req[option])
     body["business"]["id"] = str(uuid.uuid4())
     body["business"]["begin_at"] = now_ms()
     body["business"]["name"] = prompt[:30]
@@ -276,10 +279,44 @@ class BridgeDelta:
     role: str = ""
     content: str = ""
     tool_calls: list[dict[str, Any]] | None = None
+    reasoning_content: str = ""
+    usage: dict[str, Any] | None = None
+    finish_reason: str | None = None
 
     @property
     def is_empty(self) -> bool:
-        return not self.role and not self.content and not self.tool_calls
+        return not (self.role or self.content or self.tool_calls or self.reasoning_content or self.usage is not None or self.finish_reason)
+
+
+def token_usage(raw: Any) -> dict[str, Any] | None:
+    """Keep actual OpenAI token counters, excluding provider billing metadata."""
+    if not isinstance(raw, dict):
+        return None
+    usage = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            usage[key] = value
+    for key in ("prompt_tokens_details", "completion_tokens_details"):
+        details = raw.get(key)
+        if isinstance(details, dict):
+            counters = {k: v for k, v in details.items() if k.endswith("_tokens") and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+            if counters:
+                usage[key] = counters
+    return usage or None
+
+
+def merge_usage(current: dict[str, Any] | None, update: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Upstream usage events are cumulative snapshots; do not sum them."""
+    if update is None:
+        return current
+    result = copy.deepcopy(current or {})
+    for key, value in update.items():
+        if isinstance(value, dict):
+            result.setdefault(key, {}).update(value)
+        else:
+            result[key] = value
+    return result
 
 
 def extract_delta(data_line: str) -> BridgeDelta:
@@ -287,30 +324,29 @@ def extract_delta(data_line: str) -> BridgeDelta:
         obj = json.loads(data_line)
         if not isinstance(obj, dict):
             return BridgeDelta()
-        # 新版：标准 OpenAI chunk（choices 直接在顶层）
-        if "choices" in obj:
-            for choice in obj.get("choices", []):
-                delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
-                role = delta.get("role") or ""
-                content = delta.get("content") or ""
-                tool_calls = delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else None
-                if role or content or tool_calls:
-                    return BridgeDelta(role, content, tool_calls)
+        # Decode both direct OpenAI chunks and Qoder's wrapped SSE events.
+        if "body" in obj:
+            inner = obj["body"]
+            obj = json.loads(inner) if isinstance(inner, str) and inner else inner
+        if not isinstance(obj, dict):
             return BridgeDelta()
-        # 老版：wrapper 内嵌 body 字符串（可能为 "null"，MiniMax 等模型会夹在 chunk 之间）
-        inner = obj.get("body") or ""
-        if not inner:
-            return BridgeDelta()
-        inner_json = json.loads(inner)
-        if not isinstance(inner_json, dict):
-            return BridgeDelta()
-        for choice in inner_json.get("choices", []):
-            delta = choice.get("delta", {})
-            role = delta.get("role") or ""
-            content = delta.get("content") or ""
-            tool_calls = delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else None
-            if role or content or tool_calls:
-                return BridgeDelta(role, content, tool_calls)
+        if obj.get("error") or obj.get("code") == "provider_error" or obj.get("type") == "provider_error":
+            detail = obj.get("details") or obj.get("error") or obj.get("message")
+            raise RuntimeError(f"Qoder upstream error: {detail}")
+        result = BridgeDelta(usage=token_usage(obj.get("usage")))
+        for choice in obj.get("choices") or []:
+            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                continue
+            delta = choice.get("delta") or choice.get("message") or {}
+            if not isinstance(delta, dict):
+                continue
+            result.role = delta.get("role") or ""
+            result.content = delta.get("content") or ""
+            result.reasoning_content = delta.get("reasoning_content") or ""
+            result.tool_calls = delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else None
+            result.finish_reason = choice.get("finish_reason") or None
+            break
+        return result
     except (TypeError, json.JSONDecodeError):
         return BridgeDelta()
     return BridgeDelta()
@@ -346,21 +382,37 @@ class ToolCallAccumulator:
 
 async def qoder_stream_lines(sess: SessionContext, body: dict[str, Any], model: str) -> AsyncIterator[str]:
     """老版协议：POST agent_chat_generation，COSY 签名 Bearer，请求体需 QoderEncoding 编码（Encode=1）。"""
-    plain = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-    body_str = encoding.encode(plain.encode())
-    extra_headers = {
-        "x-model-key": model,
-        "x-model-source": (body.get("model_config") or {}).get("source") or "system",
-    }
-    headers = bearer_headers(sess, QODER_CHAT_URL, body_str, "text/event-stream", extra_headers)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=15), **httpx_client_kwargs()) as client:
-        async with client.stream("POST", QODER_CHAT_URL, content=body_str, headers=headers) as response:
-            if response.status_code != 200:
-                text = await response.aread()
-                raise RuntimeError(f"HTTP {response.status_code} {text.decode(errors='replace')}")
-            async for line in response.aiter_lines():
-                if line:
-                    yield line
+    emit("upstream_request", model=model, reasoning_effort=body.get("parameters", {}).get("reasoning_effort"), tools=tool_metadata(body.get("tools")), message_roles=[m.get("role") for m in body.get("messages", [])], tool_choice_present="tool_choice" in body, parallel_tool_calls_present="parallel_tool_calls" in body)
+    summary = ResponseSummary()
+    try:
+        plain = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        body_str = encoding.encode(plain.encode())
+        extra_headers = {
+            "x-model-key": model,
+            "x-model-source": (body.get("model_config") or {}).get("source") or "system",
+        }
+        headers = bearer_headers(sess, QODER_CHAT_URL, body_str, "text/event-stream", extra_headers)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=15), **httpx_client_kwargs()) as client:
+            async with client.stream("POST", QODER_CHAT_URL, content=body_str, headers=headers) as response:
+                emit("upstream_http", http_status=response.status_code)
+                if response.status_code != 200:
+                    text = await response.aread()
+                    raise RuntimeError(f"HTTP {response.status_code} {text.decode(errors='replace')}")
+                async for line in response.aiter_lines():
+                    if line:
+                        if line.startswith("data:"):
+                            value = line[5:].strip()
+                            if value == "[DONE]":
+                                summary.done = True
+                            else:
+                                try:
+                                    summary.observe(json.loads(value))
+                                except Exception:
+                                    pass
+                        yield line
+
+    finally:
+        emit("upstream_response", **summary.fields())
 
 
 async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> AsyncIterator[str]:
@@ -372,18 +424,33 @@ async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> A
     pending = ""
     streaming_text = False
     pending_role = "assistant"
+    usage = None
+    upstream_finish_reason = None
+    stream_options = req.get("stream_options") or {}
+    include_usage = isinstance(stream_options, dict) and stream_options.get("include_usage") is True
 
     def event(payload: dict[str, Any]) -> str:
+        if include_usage and payload.get("choices"):
+            payload["usage"] = None
         return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
     async for line in qoder_stream_lines(sess, body, model):
         if not line.startswith("data:"):
             continue
         delta = extract_delta(line[5:].strip())
+        usage = merge_usage(usage, delta.usage)
+        if delta.finish_reason:
+            upstream_finish_reason = delta.finish_reason
         if delta.is_empty:
             continue
         if delta.role:
             pending_role = delta.role
+        if delta.reasoning_content:
+            out_delta = {"reasoning_content": delta.reasoning_content}
+            if not emitted:
+                out_delta["role"] = pending_role
+            emitted = True
+            yield event(make_chunk(chunk_id, created, model, out_delta))
         if delta.tool_calls:
             pending = "" if tools_enabled and pending.lstrip().startswith("Tool calls:") else pending
             indexed = []
@@ -432,8 +499,10 @@ async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> A
     elif pending:
         yield event(make_chunk(chunk_id, created, model, {"content": pending, "role": pending_role} if not emitted else {"content": pending}))
 
-    finish_reason = "tool_calls" if tool_calls.calls else "stop"
+    finish_reason = upstream_finish_reason or ("tool_calls" if tool_calls.calls else "stop")
     yield event(make_chunk(chunk_id, created, model, {}, finish_reason))
+    if include_usage and usage is not None:
+        yield event({"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [], "usage": usage})
     yield "data: [DONE]\n\n"
 
 
@@ -442,11 +511,19 @@ async def complete_openai_response(req: dict[str, Any], sess: SessionContext) ->
     completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     full = []
+    reasoning = []
+    usage = None
+    upstream_finish_reason = None
     tool_calls = ToolCallAccumulator()
     async for line in qoder_stream_lines(sess, body, model):
         if not line.startswith("data:"):
             continue
         delta = extract_delta(line[5:].strip())
+        usage = merge_usage(usage, delta.usage)
+        if delta.finish_reason:
+            upstream_finish_reason = delta.finish_reason
+        if delta.reasoning_content:
+            reasoning.append(delta.reasoning_content)
         if delta.content:
             full.append(delta.content)
         if delta.tool_calls:
@@ -454,6 +531,8 @@ async def complete_openai_response(req: dict[str, Any], sess: SessionContext) ->
     content = "".join(full)
     fallback_tool_calls = None if tool_calls.calls or not tools_enabled else parse_tool_calls_text(content)
     message: dict[str, Any] = {"role": "assistant"}
+    if reasoning:
+        message["reasoning_content"] = "".join(reasoning)
     if fallback_tool_calls:
         message["content"] = None
         message["tool_calls"] = fallback_tool_calls
@@ -463,11 +542,13 @@ async def complete_openai_response(req: dict[str, Any], sess: SessionContext) ->
         message["content"] = content
     if tool_calls.calls:
         message["tool_calls"] = tool_calls.snapshot()
-    return {
+    response = {
         "id": completion_id,
         "object": "chat.completion",
         "created": created,
         "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls.calls or fallback_tool_calls else "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "choices": [{"index": 0, "message": message, "finish_reason": upstream_finish_reason or ("tool_calls" if tool_calls.calls or fallback_tool_calls else "stop")}],
     }
+    if usage is not None:
+        response["usage"] = usage
+    return response

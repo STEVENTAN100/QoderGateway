@@ -38,7 +38,10 @@ INDEX_HTML = Path(BASE_DIR) / "static" / "index.html"
 CONSOLE_HTML = Path(BASE_DIR) / "static" / "console.html"
 DOCS_HTML = Path(BASE_DIR) / "static" / "docs.html"
 
+from .diagnostics import ToolTraceMiddleware
+
 app = FastAPI(title="qoder2api-python")
+app.add_middleware(ToolTraceMiddleware)
 app.mount("/assets", StaticFiles(directory=os.path.join(BASE_DIR, "static", "assets")), name="assets")
 
 _session: SessionContext | None = None
@@ -441,20 +444,6 @@ async def fetch_cloud_models() -> list[dict[str, Any]] | None:
         return None
 
 
-async def normalize_reasoning_effort(payload: dict[str, Any]) -> None:
-    """按模型能力校正 reasoning_effort（如 GLM-5.3-Flash 不支持 none，传 none 会被上游 1210 拒绝）。"""
-    models = await fetch_cloud_models()
-    if not models:
-        return
-    info = next((m for m in models if m["id"] == payload.get("model")), None)
-    if not info:
-        return
-    effort = str(payload.get("reasoning_effort") or "none").strip().lower()
-    # 上游元数据的 efforts 不可信（gfmodel 声称 [max,high]，实测仅 low 放行）；low 是全模型实测通用档位
-    if info["efforts"] and effort not in info["efforts"] or not info["support_disable_reasoning"] and effort == "none":
-        payload["reasoning_effort"] = "low"
-
-
 @app.get("/v1/models")
 async def list_models(authorization: str | None = Header(default=None)):
     config = load_config()
@@ -488,7 +477,6 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
     model = payload.get("model", "lite")
     stream = bool(payload.get("stream", False))
     messages_count = len(payload.get("messages", []))
-    await normalize_reasoning_effort(payload)
     add_log(f"Incoming completion request: model={model}, stream={stream}, messages={messages_count}")
     
     accounts_data = db_load_accounts()
@@ -552,6 +540,11 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
                 raise HTTPException(status_code=502, detail=str(exc))
                 
     raise HTTPException(status_code=502, detail="Request failed on all available accounts.")
+
+
+from .responses_api import register_responses
+
+register_responses(app, chat_completions)
 
 
 def main() -> None:
