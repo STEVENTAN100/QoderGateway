@@ -89,15 +89,44 @@ class ResponsesTests(unittest.TestCase):
         self.assertEqual(chat["reasoning_effort"], "max")
         self.assertEqual([t["function"]["name"] for t in chat["tools"]], ["functions__exec", "functions__wait"])
 
-    def test_invalid_and_encrypted_agent_messages_are_explicitly_rejected(self):
+    def test_encrypted_agent_fragments_do_not_block_visible_history(self):
+        for content in ([{"type": "input_text", "text": "Task: return 5"}, {"type": "encrypted_content", "encrypted_content": "CIPHERTEXT_SENTINEL"}],
+                        [{"type": "encrypted_content", "encrypted_content": "CIPHERTEXT_SENTINEL"}],
+                        [{"type": "input_text", "text": "Task: return 5"}, {"type": "encrypted_content", "encrypted_content": "CIPHERTEXT_SENTINEL"},
+                         {"type": "input_text", "text": "中文\nnext"}]):
+            with self.subTest(content=content):
+                payload = request()
+                agent = {"type": "agent_message", "author": "/root", "recipient": "/root/worker", "content": content}
+                payload["input"] += [
+                    {"type": "reasoning", "encrypted_content": "REASONING_CIPHERTEXT_SENTINEL", "summary": []}, agent,
+                    {"type": "custom_tool_call", "call_id": "call_resume", "name": "exec", "namespace": "functions", "input": RAW_INPUT},
+                    {"type": "custom_tool_call_output", "call_id": "call_resume", "output": "5"},
+                    {"role": "user", "content": "Continue"},
+                ]
+                before = json.dumps(payload)
+                chat, _ = api.to_chat(payload)
+                self.assertEqual(json.dumps(payload), before)
+                converted = chat["messages"][1]["content"]
+                self.assertIn('"recipient": "/root/worker"', converted)
+                self.assertIn("encrypted agent message fragment(s)", converted)
+                self.assertIn("could not be decoded and were omitted", converted)
+                self.assertNotIn("CIPHERTEXT_SENTINEL", json.dumps(chat))
+                for part in content:
+                    if part["type"] == "input_text":
+                        self.assertIn(part["text"], converted)
+                self.assertEqual([message["role"] for message in chat["messages"]], ["user", "user", "assistant", "tool", "user"])
+                self.assertEqual(chat["messages"][-2]["tool_call_id"], "call_resume")
+                self.assertEqual(chat["reasoning_effort"], "max")
+
+    def test_invalid_agent_messages_are_explicitly_rejected(self):
         base = {"type": "agent_message", "author": "/root/worker", "recipient": "/root",
                 "content": [{"type": "input_text", "text": "Done"}]}
         for fields in ({"author": None}, {"author": " "}, {"recipient": 1}, {"recipient": ""},
                        {"content": None}, {"content": {}},
                        {"content": [{"type": "input_text", "text": 3}]},
                        {"content": [{"type": "input_image", "image_url": "x"}]},
-                       {"content": [{"type": "encrypted_content", "encrypted_content": "secret"}]},
-                       {"content": [*base["content"], {"type": "encrypted_content", "encrypted_content": "secret"}]}):
+                       {"content": [{"type": "encrypted_content", "encrypted_content": None}]},
+                       {"content": [{"type": "encrypted_content"}]}):
             with self.subTest(fields=fields), self.assertRaises(HTTPException) as caught:
                 api.to_chat({**request(), "input": [{**base, **fields}]})
             self.assertEqual(caught.exception.status_code, 400)
@@ -118,7 +147,8 @@ class ResponsesTests(unittest.TestCase):
         api.register_responses(app, handler)
         payload = request()
         payload["input"].insert(1, {"type": "agent_message", "author": "/root/reviewer", "recipient": "/root",
-                                    "content": [{"type": "input_text", "text": "Please continue"}]})
+                                    "content": [{"type": "input_text", "text": "Please continue"},
+                                                {"type": "encrypted_content", "encrypted_content": "CIPHERTEXT_SENTINEL"}]})
         with TestClient(app) as client:
             for stream in (False, True):
                 with self.subTest(stream=stream):
@@ -129,7 +159,9 @@ class ResponsesTests(unittest.TestCase):
                     self.assertEqual(result["output"][-1]["input"], RAW_INPUT)
                     self.assertEqual(result["output"][-1]["call_id"], "call_exact")
                     self.assertEqual(result["usage"]["output_tokens_details"]["reasoning_tokens"], 8)
-                    self.assertTrue(observed[-1]["messages"][0]["content"].endswith("\nPlease continue"))
+                    self.assertIn("\nPlease continue", observed[-1]["messages"][0]["content"])
+                    self.assertIn("could not be decoded and were omitted", observed[-1]["messages"][0]["content"])
+                    self.assertNotIn("CIPHERTEXT_SENTINEL", json.dumps(observed[-1]))
 
     def test_additional_tools_and_custom_result_roundtrip(self):
         payload = request()

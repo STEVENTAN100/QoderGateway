@@ -119,10 +119,25 @@ def agent_message(item):
     content = item.get("content")
     if not isinstance(content, (str, list)):
         raise HTTPException(400, detail="agent_message.content must be text or a content array")
-    if isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "encrypted_content" for part in content):
-        raise HTTPException(400, detail="Encrypted agent_message content cannot be decoded by Qoder; send plaintext input_text content")
+    encrypted_parts = 0
+    if isinstance(content, list):
+        readable = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "encrypted_content":
+                if not isinstance(part.get("encrypted_content"), str):
+                    raise HTTPException(400, detail="agent_message encrypted_content must be a string")
+                encrypted_parts += 1
+            else:
+                readable.append(part)
+        content = readable
     routing = json.dumps({"author": item["author"], "recipient": item["recipient"]}, ensure_ascii=False)
-    return {"role": "user", "content": "Agent message " + routing + "\n" + text_content(content)}
+    body = text_content(content)
+    if encrypted_parts:
+        body += ("\n[Gateway notice: " + str(encrypted_parts) + " encrypted agent message fragment(s) "
+                 "could not be decoded and were omitted. Continue using the readable conversation "
+                 "and tool history. If essential task details are missing, request a plaintext "
+                 "restatement from the sender; do not invent the omitted content.]")
+    return {"role": "user", "content": "Agent message " + routing + "\n" + body}
 
 
 def to_chat(payload):

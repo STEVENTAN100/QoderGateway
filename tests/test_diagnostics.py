@@ -27,7 +27,8 @@ class DiagnosticsTests(unittest.TestCase):
                        "type": "namespace", "name": "functions", "description": private, "tools": [{
                            "type": "custom", "name": "exec", "description": private, "format": {"type": "text"}}]}]},
                        {"type": "agent_message", "author": "/root/reviewer", "recipient": "/root",
-                        "content": [{"type": "input_text", "text": private}]},
+                        "content": [{"type": "input_text", "text": private},
+                                    {"type": "encrypted_content", "encrypted_content": private}]},
                        {"role": "user", "content": private}]}
         events = [{"type": "response.output_item.done", "item": call},
                   {"type": "response.completed", "response": final}]
@@ -60,7 +61,8 @@ class DiagnosticsTests(unittest.TestCase):
                 self.assertEqual(inbound["input_tool_declarations"][0]["tools"][0]["name"], "exec")
                 self.assertEqual(inbound["input_tool_declarations"][0]["tools"][0]["namespace"], "functions")
                 self.assertEqual(inbound["input_agent_messages"], [{"input_index": 1, "author": "/root/reviewer", "recipient": "/root",
-                                                                  "content_types": ["input_text"], "content_chars": len(private)}])
+                                                                  "content_types": ["input_text", "encrypted_content"], "content_chars": len(private),
+                                                                  "encrypted_parts_omitted": 1}])
                 outbound = next(record for record in records if record["stage"] == "client_response")
                 self.assertEqual(outbound["tool_names"], ["functions.exec"])
                 self.assertEqual(outbound["tool_argument_chars"], len(input_text))
