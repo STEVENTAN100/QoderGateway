@@ -80,7 +80,14 @@ def request_metadata(payload):
     if "input" in payload:
         incoming = payload.get("input")
         declarations = [{"input_index": index, "type": label(item.get("type")), "tools": tool_metadata(item.get("tools"))} for index, item in enumerate(incoming) if isinstance(item, dict) and item.get("type") in ("additional_tools", "tool_search_output")] if isinstance(incoming, list) else []
-        return {"model": label(payload.get("model")), "stream": bool(payload.get("stream")), "reasoning_effort": label((payload.get("reasoning") or {}).get("effort")), "tools": tool_metadata(payload.get("tools")), "input_tool_declarations": declarations, "input_types": [label(item.get("type", "message")) for item in incoming if isinstance(item, dict)] if isinstance(incoming, list) else ["text"], "store": payload.get("store"), "tool_choice": label(choice) if not isinstance(choice, dict) else label(choice.get("type"))}
+        agents = []
+        for index, item in enumerate(incoming if isinstance(incoming, list) else []):
+            if not isinstance(item, dict) or item.get("type") != "agent_message":
+                continue
+            content = item.get("content")
+            parts = [part for part in content if isinstance(part, dict)] if isinstance(content, list) else []
+            agents.append({"input_index": index, "author": label(item.get("author")), "recipient": label(item.get("recipient")), "content_types": [label(part.get("type")) for part in parts] if isinstance(content, list) else ["text"] if isinstance(content, str) else [], "content_chars": len(content) if isinstance(content, str) else sum(len(part["text"]) for part in parts if isinstance(part.get("text"), str))})
+        return {"model": label(payload.get("model")), "stream": bool(payload.get("stream")), "reasoning_effort": label((payload.get("reasoning") or {}).get("effort")), "tools": tool_metadata(payload.get("tools")), "input_tool_declarations": declarations, "input_agent_messages": agents, "input_types": [label(item.get("type", "message")) for item in incoming if isinstance(item, dict)] if isinstance(incoming, list) else ["text"], "store": payload.get("store"), "tool_choice": label(choice) if not isinstance(choice, dict) else label(choice.get("type"))}
     return {"model": label(payload.get("model")), "stream": bool(payload.get("stream")), "reasoning_effort": label(payload.get("reasoning_effort")), "effort_field_present": "reasoning_effort" in payload, "tool_choice": label(choice) if not isinstance(choice, dict) else {"type": label(choice.get("type")), "name": label((choice.get("function") or {}).get("name") or choice.get("name"))}, "parallel_tool_calls": payload.get("parallel_tool_calls") if isinstance(payload.get("parallel_tool_calls"), bool) else None, "include_usage": bool(options.get("include_usage")) if isinstance(options, dict) else False, "tools": tool_metadata(payload.get("tools")), "messages": history}
 
 

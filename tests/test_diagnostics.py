@@ -26,6 +26,8 @@ class DiagnosticsTests(unittest.TestCase):
                    "input": [{"type": "additional_tools", "role": "developer", "tools": [{
                        "type": "namespace", "name": "functions", "description": private, "tools": [{
                            "type": "custom", "name": "exec", "description": private, "format": {"type": "text"}}]}]},
+                       {"type": "agent_message", "author": "/root/reviewer", "recipient": "/root",
+                        "content": [{"type": "input_text", "text": private}]},
                        {"role": "user", "content": private}]}
         events = [{"type": "response.output_item.done", "item": call},
                   {"type": "response.completed", "response": final}]
@@ -57,6 +59,8 @@ class DiagnosticsTests(unittest.TestCase):
                 inbound = next(record for record in records if record["stage"] == "client_request")
                 self.assertEqual(inbound["input_tool_declarations"][0]["tools"][0]["name"], "exec")
                 self.assertEqual(inbound["input_tool_declarations"][0]["tools"][0]["namespace"], "functions")
+                self.assertEqual(inbound["input_agent_messages"], [{"input_index": 1, "author": "/root/reviewer", "recipient": "/root",
+                                                                  "content_types": ["input_text"], "content_chars": len(private)}])
                 outbound = next(record for record in records if record["stage"] == "client_response")
                 self.assertEqual(outbound["tool_names"], ["functions.exec"])
                 self.assertEqual(outbound["tool_argument_chars"], len(input_text))

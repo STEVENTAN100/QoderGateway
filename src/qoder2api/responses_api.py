@@ -105,8 +105,24 @@ def text_content(content):
     for part in content:
         if not isinstance(part, dict) or part.get("type") not in ("input_text", "output_text", "text"):
             raise HTTPException(400, detail="This Responses endpoint currently supports text content; image/file content is not implemented")
-        parts.append(part.get("text") or "")
+        if not isinstance(part.get("text"), str):
+            raise HTTPException(400, detail="Text content parts must contain a string text field")
+        parts.append(part["text"])
     return "\n".join(parts)
+
+
+def agent_message(item):
+    """Represent peer-agent context without granting it an instruction role."""
+    for field in ("author", "recipient"):
+        if not isinstance(item.get(field), str) or not item[field].strip():
+            raise HTTPException(400, detail=f"agent_message.{field} must be a nonempty string")
+    content = item.get("content")
+    if not isinstance(content, (str, list)):
+        raise HTTPException(400, detail="agent_message.content must be text or a content array")
+    if isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "encrypted_content" for part in content):
+        raise HTTPException(400, detail="Encrypted agent_message content cannot be decoded by Qoder; send plaintext input_text content")
+    routing = json.dumps({"author": item["author"], "recipient": item["recipient"]}, ensure_ascii=False)
+    return {"role": "user", "content": "Agent message " + routing + "\n" + text_content(content)}
 
 
 def to_chat(payload):
@@ -168,6 +184,8 @@ def to_chat(payload):
             if role not in ("system", "user", "assistant"):
                 raise HTTPException(400, detail=f"Unsupported message role: {role}")
             messages.append({"role": role, "content": text_content(item.get("content"))})
+        elif kind == "agent_message":
+            messages.append(agent_message(item))
         elif kind in ("function_call", "custom_tool_call"):
             tool = tools.resolve(item.get("name"), item.get("namespace"))
             if tool.kind != ("custom" if kind == "custom_tool_call" else "function"):

@@ -155,6 +155,8 @@ curl http://127.0.0.1:5050/v1/responses \
 
 工具适配支持 `function`、`custom` 自由文本工具和 `namespace`：`functions.exec`、`functions.apply_patch` 等自由文本输入会恢复为 `custom_tool_call`，保留 `name`、`namespace` 和 `call_id`，后续接收 `custom_tool_call_output`。工具可在顶层 `tools` 中声明，也可由 `input` 中的 `additional_tools` 提供；重复历史声明会合并，并采用同名工具的最新定义。`configuration_update` 中的思考配置和客户端已经执行的 `tool_search_output` 中的工具声明也会处理。
 
+支持 Codex 多代理历史中的明文 `agent_message`：保留 `author`、`recipient`、正文和消息顺序，转换为带发送者/接收者标识的 `user` 上下文消息。代理消息不会被提升为 `system` 或 `developer` 指令，也不会替代工具结果的 `call_id`。Qoder 无法解码 OpenAI 的 `encrypted_content`，含加密片段的代理消息会明确返回 `400`，需要客户端提供明文 `input_text`。
+
 ### Chat Completions 的 usage 与思考文本
 
 原 `/v1/chat/completions` 接口继续可用。非流式回答和思考文本分别位于 `choices[0].message.content`、`choices[0].message.reasoning_content`，实际计数位于顶层 `usage`。流式思考文本位于 `choices[0].delta.reasoning_content`；如需流式 usage，在请求中添加：
@@ -185,7 +187,7 @@ Chat Completions 的 `reasoning_effort` 和 Responses 的 `reasoning.effort` 会
 
 两种 API 请求都带有 `X-Qoder-Trace-Id` 响应头。默认诊断日志位于运行用户的 `~/.qoder/diagnostics/tool-trace.jsonl`，按 5 MiB 轮转并保留 3 个备份，关联客户端请求、上游请求、上游响应和客户端响应。
 
-日志只保存工具名称/类型、声明位置、消息角色、字符长度、思考强度和响应状态，不保存提示词正文、思考文本、工具参数值或认证头。排查时应将这些元数据与客户端执行结果对应；HTTP 200 和工具调用事件本身不能证明本地命令已成功执行。
+日志只保存工具名称/类型、声明位置、消息角色、字符长度、思考强度和响应状态；`input_agent_messages` 记录代理消息的位置、发送者/接收者标识、内容类型和字符长度。不保存提示词正文、代理消息正文、思考文本、工具参数值或认证头。排查时应将这些元数据与客户端执行结果对应；HTTP 200 和工具调用事件本身不能证明本地命令已成功执行。
 
 ### 离线回归验证
 

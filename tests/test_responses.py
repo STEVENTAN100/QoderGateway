@@ -62,6 +62,75 @@ async def collect(payload, chunks):
 
 
 class ResponsesTests(unittest.TestCase):
+    def test_agent_messages_preserve_context_and_tool_history(self):
+        payload = request()
+        text = 'Message Type: FINAL_ANSWER\nPayload:\n已完成校验。\n  Indentation "quoted" \\ path'
+        agent = {"type": "agent_message", "id": "amsg_history", "author": "/root/reviewer", "recipient": "/root",
+                 "content": [{"type": "input_text", "text": text}, {"type": "input_text", "text": "Next step"}],
+                 "role": "developer", "internal_chat_message_metadata_passthrough": {"turn_id": "turn_history"}}
+        payload["input"] += [
+            {"type": "custom_tool_call", "call_id": "call_history", "name": "exec", "namespace": "functions", "input": RAW_INPUT},
+            {"type": "custom_tool_call_output", "call_id": "call_history", "output": "done"},
+            agent,
+            {"type": "agent_message", "author": "/root", "recipient": "/root/reviewer", "content": "Thanks"},
+            {"role": "user", "content": "Continue"},
+        ]
+        before = json.dumps(payload, ensure_ascii=False)
+        chat, _ = api.to_chat(payload)
+        self.assertEqual(json.dumps(payload, ensure_ascii=False), before)
+        self.assertEqual([item["role"] for item in chat["messages"]], ["user", "assistant", "tool", "user", "user", "user"])
+        self.assertEqual(chat["messages"][2]["tool_call_id"], "call_history")
+        converted = chat["messages"][3]["content"]
+        header, body = converted.split("\n", 1)
+        self.assertEqual(json.loads(header.removeprefix("Agent message ")), {"author": "/root/reviewer", "recipient": "/root"})
+        self.assertEqual(body, text + "\nNext step")
+        self.assertTrue(chat["messages"][4]["content"].endswith("\nThanks"))
+        self.assertEqual(chat["messages"][-1]["content"], "Continue")
+        self.assertEqual(chat["reasoning_effort"], "max")
+        self.assertEqual([t["function"]["name"] for t in chat["tools"]], ["functions__exec", "functions__wait"])
+
+    def test_invalid_and_encrypted_agent_messages_are_explicitly_rejected(self):
+        base = {"type": "agent_message", "author": "/root/worker", "recipient": "/root",
+                "content": [{"type": "input_text", "text": "Done"}]}
+        for fields in ({"author": None}, {"author": " "}, {"recipient": 1}, {"recipient": ""},
+                       {"content": None}, {"content": {}},
+                       {"content": [{"type": "input_text", "text": 3}]},
+                       {"content": [{"type": "input_image", "image_url": "x"}]},
+                       {"content": [{"type": "encrypted_content", "encrypted_content": "secret"}]},
+                       {"content": [*base["content"], {"type": "encrypted_content", "encrypted_content": "secret"}]}):
+            with self.subTest(fields=fields), self.assertRaises(HTTPException) as caught:
+                api.to_chat({**request(), "input": [{**base, **fields}]})
+            self.assertEqual(caught.exception.status_code, 400)
+
+    def test_agent_message_route_with_streaming_and_nonstreaming_tool_calls(self):
+        app = FastAPI()
+        observed = []
+        async def handler(payload, authorization):
+            observed.append(payload)
+            if payload.get("stream"):
+                async def source():
+                    yield stream_chunk({"tool_calls": [{"index": 0, **completion()["choices"][0]["message"]["tool_calls"][0]}]})
+                    yield stream_chunk(finish="tool_calls")
+                    yield stream_chunk(usage=USAGE)
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(source())
+            return completion()
+        api.register_responses(app, handler)
+        payload = request()
+        payload["input"].insert(1, {"type": "agent_message", "author": "/root/reviewer", "recipient": "/root",
+                                    "content": [{"type": "input_text", "text": "Please continue"}]})
+        with TestClient(app) as client:
+            for stream in (False, True):
+                with self.subTest(stream=stream):
+                    response = client.post("/v1/responses", json={**payload, "stream": stream})
+                    self.assertEqual(response.status_code, 200)
+                    result = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")][-1]["response"] if stream else response.json()
+                    self.assertEqual(result["status"], "completed")
+                    self.assertEqual(result["output"][-1]["input"], RAW_INPUT)
+                    self.assertEqual(result["output"][-1]["call_id"], "call_exact")
+                    self.assertEqual(result["usage"]["output_tokens_details"]["reasoning_tokens"], 8)
+                    self.assertTrue(observed[-1]["messages"][0]["content"].endswith("\nPlease continue"))
+
     def test_additional_tools_and_custom_result_roundtrip(self):
         payload = request()
         chat, tools = api.to_chat(payload)
