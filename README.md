@@ -157,6 +157,32 @@ curl http://127.0.0.1:5050/v1/responses \
 
 支持 Codex 多代理历史中的 `agent_message`：保留 `author`、`recipient`、可读正文和消息顺序，转换为带发送者/接收者标识的 `user` 上下文消息。代理消息不会被提升为 `system` 或 `developer` 指令，也不会替代工具结果的 `call_id`。Qoder 无法解码 OpenAI 的 `encrypted_content`；网关跳过这些片段，保留其余明文，并添加明确的缺失说明，使已有对话和工具流程可以继续。纯密文代理消息也保留路由标识及缺失说明。如果具体任务仅存在于密文，仍需发送者补充可读任务，网关不会编造或宣称恢复密文内容。普通 `reasoning` 历史项沿用跳过处理，不影响后续请求。
 
+### 客户端上下文压缩
+
+兼容客户端通过 `/v1/responses` 发送摘要指令的压缩流程。压缩请求可能带完整工具历史，却不再声明这些工具；网关会把未声明或定义类型已变化的历史工具调用及结果转换成带工具名称、`call_id` 和正文的普通对话，让模型可以读取和总结，不再因为缺少工具定义返回 `400`。当前仍有匹配定义的调用继续保留工具格式。
+
+历史中的 `reasoning`、`compaction` 密文项和 `item_reference` 会跳过；网关不能解密或读取服务端未保存的引用，需要客户端提供可读历史或摘要。这不提供独立的 `/v1/responses/compact` 接口，也不实现 `context_management` 自动压缩。
+
+### 图片输入
+
+支持用户消息里的 Responses `input_image.image_url`，以及 Chat Completions 的 `image_url` 内容片段，可使用图片 URL 或 `data:image/...;base64,...`。图文顺序会保留，图片以结构化内容传给 Qoder，不会将 Base64 字符串拼接成提示词正文；上游请求会设置视觉输入标识。
+
+工具结果中的图片（例如客户端 `view_image` 返回的 `input_image`）也会转发：保留工具结果和 `call_id`，将图片附在连续工具结果之后的用户消息里，避免把图片放进仅支持文本的 `tool` 消息。上游模型是否能识别图片仍取决于该模型的视觉能力；只提供 `file_id` 的图片、文件和音频不会上传解析，会保留附件省略提示。
+
+Responses 图片请求的 `input` 示例：
+
+```json
+[
+  {
+    "role": "user",
+    "content": [
+      {"type": "input_text", "text": "描述这张图片。"},
+      {"type": "input_image", "image_url": "data:image/png;base64,<替换为实际图片Base64>"}
+    ]
+  }
+]
+```
+
 ### Chat Completions 的 usage 与思考文本
 
 原 `/v1/chat/completions` 接口继续可用。非流式回答和思考文本分别位于 `choices[0].message.content`、`choices[0].message.reasoning_content`，实际计数位于顶层 `usage`。流式思考文本位于 `choices[0].delta.reasoning_content`；如需流式 usage，在请求中添加：
@@ -174,14 +200,15 @@ Chat Completions 的 `reasoning_effort` 和 Responses 的 `reasoning.effort` 会
 
 ### 当前兼容范围
 
-这是面向文本与工具调用的 Responses 适配，不是完整的 OpenAI 平台实现：
+这是面向文本、图片输入与工具调用的 Responses 适配，不是完整的 OpenAI 平台实现：
 
 - 使用 `store=false` 并在 `input` 中传递完整对话历史；不支持 `previous_response_id`、服务端历史查询/删除、后台响应和服务端 compaction。
-- 不支持原生 `web_search`、图像/文件输入、服务端执行的 `tool_search` 或结构化 JSON 输出；不支持的类型会明确返回 `400`。客户端已执行工具搜索后的工具声明可以读取。
+- 不执行原生 `web_search`、`file_search`、`code_interpreter` 等服务端托管工具；相关声明和历史调用项会跳过。客户端已执行工具搜索后的工具声明可以读取，网关自身不执行 `tool_search`。
+- 支持 URL 或 data URL 形式的用户消息和工具结果图片；文件、音频及仅提供 `file_id` 的图片保留省略提示。结构化 JSON 输出及其他未适配的类型仍返回 `400`。
 - 自由文本工具的 grammar 会加入工具说明；上游没有原生语法约束采样保证。工具输入需要等 JSON 参数完整后再解码，长代码的工具调用可能延后出现。
 - 客户端工具说明、模型生成代码与本地权限仍影响实际执行。模型传错参数类型或本地策略拒绝执行，与网关是否保留工具入口需要分别判断。
 
-实际验证覆盖 Codex 0.159.2 的自由文本执行入口、`additional_tools`、流式/非流式和多轮工具结果；离线测试覆盖关键转换边界。
+既有验证覆盖 Codex 0.159.2 的自由文本执行入口、`additional_tools`、流式/非流式和多轮工具结果。图片结构透传与无工具声明的摘要历史转换可在本地验证；具体模型的视觉识别与客户端完整压缩效果需要结合实际请求判断。
 
 ### 工具诊断日志
 

@@ -20,6 +20,24 @@ QODER_CHAT_URL = "https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent
 QODER_CHAT_URL_NEW = "https://gateway.qoder.com.cn/model/v1/chat/completions"
 
 
+# Input windows per model key, from the CN model catalog (gmodel/gfmodel) and
+# the Qoder CLI built-in catalog. Sent as model_config.max_input_tokens and
+# parameters.context_length so upstream applies the model's real window.
+MODEL_CONTEXT_TOKENS = {
+    "auto": 180000, "efficient": 180000, "lite": 180000,
+    "ultimate": 1000000, "performance": 1000000, "cmodel": 1000000,
+    "qmodel_38max": 1000000, "qfmodel": 1000000, "qmodel_latest": 1000000,
+    "qmodel": 1000000, "q37fmodel": 1000000, "kmodel_latest": 1000000,
+    "kmodel": 256000, "gmodel": 180000, "gfmodel": 1000000, "gm51model": 1000000,
+    "dmodel": 1000000, "dfmodel": 1000000, "mmodel": 1000000,
+}
+DEFAULT_CONTEXT_TOKENS = 180000
+
+
+def context_tokens(model: str) -> int:
+    return MODEL_CONTEXT_TOKENS.get(model, DEFAULT_CONTEXT_TOKENS)
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -108,10 +126,9 @@ def normalize_content_part(item: Any) -> str:
     if isinstance(item, dict):
         if isinstance(item.get("text"), str):
             return item["text"]
-        if item.get("type") in {"image_url", "input_image"} and isinstance(item.get("image_url"), dict):
-            url = item["image_url"].get("url")
-            if isinstance(url, str):
-                return f"[image] {url}"
+        if image_url(item):
+            # Images travel as structured parts; never inline data URLs as text.
+            return ""
         if isinstance(item.get("content"), (dict, list)):
             return normalize_content(item["content"])
         return json.dumps(item, ensure_ascii=False)
@@ -132,7 +149,36 @@ def extract_latest_user_prompt(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def build_user_message(text: str) -> dict[str, Any]:
+def image_url(item: Any) -> str | None:
+    """URL of an OpenAI image part ({"image_url": {"url"}} or Responses' string form)."""
+    if not isinstance(item, dict) or item.get("type") not in {"image_url", "input_image"}:
+        return None
+    url = item.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    return url if isinstance(url, str) and url.strip() else None
+
+
+def image_parts(content: Any) -> list[dict[str, Any]] | None:
+    """Upstream text/image_url parts, as qodercli2api sends them; None without images."""
+    if not isinstance(content, list) or not any(image_url(item) for item in content):
+        return None
+    parts = []
+    for item in content:
+        url = image_url(item)
+        if url:
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+        else:
+            text = normalize_content_part(item)
+            if text.strip():
+                parts.append({"type": "text", "text": text})
+    return parts
+
+
+def build_user_message(text: str, parts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if parts:
+        # Vision requests carry the parts in both content and contents.
+        return {"role": "user", "content": copy.deepcopy(parts), "contents": parts, "response_meta": blank_response_meta(), "reasoning_content_signature": ""}
     return {
         "role": "user",
         "content": "",
@@ -212,10 +258,11 @@ def convert_incoming_message(message: dict[str, Any], tools_enabled: bool) -> di
             return out
         role = "user"
         text = render_tool_result(message, text)
-    if not text.strip() and not (tools_enabled and role == "assistant" and message.get("tool_calls")):
+    images = image_parts(message.get("content")) if role == "user" else None
+    if not text.strip() and not images and not (tools_enabled and role == "assistant" and message.get("tool_calls")):
         return None
     if role == "user":
-        return build_user_message(text)
+        return build_user_message(text, images)
     out = build_structured_message(role, text)
     if tools_enabled and role == "assistant":
         tool_calls = normalize_tool_calls(message.get("tool_calls")) or parse_tool_calls_text(text)
@@ -253,13 +300,14 @@ def build_qoder_body(req: dict[str, Any], sess: SessionContext) -> tuple[dict[st
     body["stream"] = True
     body["aliyun_user_type"] = sess.identity.user_type
     body["model_config"]["key"] = model
+    body["model_config"]["max_input_tokens"] = context_tokens(model)
     body["chat_context"]["extra"]["modelConfig"]["key"] = model
     prompt = extract_latest_user_prompt(messages)
     body["chat_context"]["text"]["text"] = prompt
     body["chat_context"]["extra"]["originalContent"]["text"] = prompt
     # Preserve the caller's reasoning_effort; upstream validates model support.
     # Keep the existing default only when the field is omitted.
-    body["parameters"] = {"max_tokens": 32768, "reasoning_effort": req.get("reasoning_effort", "none")}
+    body["parameters"] = {"max_tokens": 32768, "reasoning_effort": req.get("reasoning_effort", "none"), "context_length": context_tokens(model)}
     if "max_tokens" in req:
         body["parameters"]["max_tokens"] = req["max_tokens"]
     for option in ("tool_choice", "parallel_tool_calls"):
@@ -269,6 +317,9 @@ def build_qoder_body(req: dict[str, Any], sess: SessionContext) -> tuple[dict[st
     body["business"]["begin_at"] = now_ms()
     body["business"]["name"] = prompt[:30]
     body["messages"] = build_qoder_messages(body["messages"], messages, prompt, tools_enabled)
+    if any(isinstance(m.get("content"), list) for m in body["messages"]):
+        body["model_config"]["is_vl"] = True
+        body["chat_context"]["extra"]["modelConfig"]["is_vl"] = True
     if tools_enabled:
         body["tools"] = copy.deepcopy(req["tools"])
     return body, model, tools_enabled

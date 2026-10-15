@@ -16,6 +16,17 @@ def new_id(prefix):
     return prefix + uuid.uuid4().hex[:24]
 
 
+HOSTED_TOOL_TYPES = {
+    "web_search", "web_search_preview", "file_search", "code_interpreter",
+    "image_generation", "computer_use_preview", "mcp",
+}
+# Output items of hosted tools that clients replay in later histories.
+HOSTED_CALL_ITEMS = {
+    "web_search_call", "file_search_call", "code_interpreter_call",
+    "image_generation_call", "mcp_list_tools", "mcp_call",
+}
+
+
 @dataclass
 class Tool:
     name: str
@@ -49,6 +60,10 @@ class Tools:
         if not isinstance(definition, dict):
             raise HTTPException(400, detail="Tool definitions must be objects")
         kind = definition.get("type")
+        if kind in HOSTED_TOOL_TYPES:
+            # OpenAI-hosted tools run server-side; Qoder cannot execute them,
+            # so the model simply does not see them (as in qodercli2api).
+            return
         if kind not in ("function", "custom"):
             raise HTTPException(400, detail=f"Unsupported Responses tool type: {kind}. This endpoint supports function, custom and namespace tools.")
         name = definition.get("name")
@@ -83,7 +98,7 @@ class Tools:
             self.positions[key] = len(self.definitions)
             self.definitions.append(converted)
 
-    def resolve(self, name, namespace=None):
+    def lookup(self, name, namespace=None):
         if (namespace, name) in self.by_name:
             return self.by_name[namespace, name]
         if name in self.by_alias:
@@ -91,7 +106,13 @@ class Tools:
         matches = [t for t in self.by_alias.values() if t.name == name]
         if namespace is None and len(matches) == 1:
             return matches[0]
-        raise HTTPException(400, detail=f"Tool is not defined or ambiguous: {name}")
+        return None
+
+    def resolve(self, name, namespace=None):
+        tool = self.lookup(name, namespace)
+        if tool is None:
+            raise HTTPException(400, detail=f"Tool is not defined or ambiguous: {name}")
+        return tool
 
 
 def text_content(content):
@@ -103,12 +124,49 @@ def text_content(content):
         raise HTTPException(400, detail="Message content must be text or a content array")
     parts = []
     for part in content:
+        if isinstance(part, dict) and part.get("type") in ("input_image", "input_file", "input_audio"):
+            # Qoder's legacy endpoint is text-only. Keep a visible marker so
+            # long histories (e.g. compaction) do not fail on one attachment.
+            parts.append("[" + part["type"][6:] + " omitted: the gateway forwards text only]")
+            continue
         if not isinstance(part, dict) or part.get("type") not in ("input_text", "output_text", "text"):
             raise HTTPException(400, detail="This Responses endpoint currently supports text content; image/file content is not implemented")
         if not isinstance(part.get("text"), str):
             raise HTTPException(400, detail="Text content parts must contain a string text field")
         parts.append(part["text"])
     return "\n".join(parts)
+
+
+def image_part(part):
+    """OpenAI chat image part for a Responses input_image with a URL/data URL."""
+    if isinstance(part, dict) and part.get("type") == "input_image":
+        url = part.get("image_url")
+        url = url.get("url") if isinstance(url, dict) else url
+        if isinstance(url, str) and url.strip():
+            return {"type": "image_url", "image_url": {"url": url}}
+    return None
+
+
+def chat_content(content):
+    """Text, or ordered text/image_url parts when the content carries images."""
+    if not isinstance(content, list) or not any(image_part(p) for p in content):
+        return text_content(content)
+    parts = []
+    for part in content:
+        image = image_part(part)
+        if image:
+            parts.append(image)
+        elif text := text_content([part]):
+            parts.append({"type": "text", "text": text})
+    return parts
+
+
+def split_images(content):
+    """(text, image parts) for tool outputs, whose chat role cannot hold images."""
+    if not isinstance(content, list):
+        return text_content(content), []
+    images = [image for image in map(image_part, content) if image]
+    return text_content([p for p in content if not image_part(p)]), images
 
 
 def agent_message(item):
@@ -186,6 +244,24 @@ def to_chat(payload):
             if "effort" in update:
                 history_reasoning["effort"] = update["effort"]
     tools = Tools(definitions)
+    # Codex compaction turns resend the whole history but declare no tools.
+    # Calls to tools absent from this request become plain transcript text,
+    # with their outputs, so the model can still read and summarize them.
+    transcript_calls = set()
+    # Tool messages cannot carry images (e.g. Codex view_image output); they
+    # follow the tool results as one user message, keeping results contiguous.
+    tool_images = []
+
+    def flush_images():
+        if tool_images:
+            messages.append({"role": "user", "content": [{"type": "text", "text": "[Images returned by the tool calls above]"}] + tool_images[:]})
+            tool_images.clear()
+
+    def push(message):
+        if message["role"] != "tool":
+            flush_images()
+        messages.append(message)
+
     for item in incoming:
         if not isinstance(item, dict):
             raise HTTPException(400, detail="Response input items must be objects")
@@ -198,32 +274,46 @@ def to_chat(payload):
             role = "system" if role == "developer" else role
             if role not in ("system", "user", "assistant"):
                 raise HTTPException(400, detail=f"Unsupported message role: {role}")
-            messages.append({"role": role, "content": text_content(item.get("content"))})
+            push({"role": role, "content": chat_content(item.get("content")) if role == "user" else text_content(item.get("content"))})
         elif kind == "agent_message":
-            messages.append(agent_message(item))
+            push(agent_message(item))
         elif kind in ("function_call", "custom_tool_call"):
-            tool = tools.resolve(item.get("name"), item.get("namespace"))
-            if tool.kind != ("custom" if kind == "custom_tool_call" else "function"):
-                raise HTTPException(400, detail="Tool call type does not match its definition")
             call_id = item.get("call_id")
             if not call_id:
                 raise HTTPException(400, detail="Tool call requires call_id")
+            tool = tools.lookup(item.get("name"), item.get("namespace"))
+            if tool is None or tool.kind != ("custom" if kind == "custom_tool_call" else "function"):
+                transcript_calls.add(call_id)
+                name = (item["namespace"] + "." if item.get("namespace") else "") + str(item.get("name"))
+                body = item.get("input", "") if kind == "custom_tool_call" else item.get("arguments", "{}")
+                push({"role": "assistant", "content": f"[Earlier tool call {name} ({call_id})]\n{body}"})
+                continue
             arguments = json.dumps({"input": item.get("input", "")}, ensure_ascii=False) if tool.kind == "custom" else item.get("arguments", "{}")
             call = {"id": call_id, "type": "function", "function": {"name": tool.alias, "arguments": arguments}}
             if messages and messages[-1]["role"] == "assistant" and messages[-1].get("tool_calls"):
                 messages[-1]["tool_calls"].append(call)
             else:
-                messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
+                push({"role": "assistant", "content": None, "tool_calls": [call]})
         elif kind in ("function_call_output", "custom_tool_call_output"):
             if not item.get("call_id"):
                 raise HTTPException(400, detail="Tool output requires call_id")
-            messages.append({"role": "tool", "tool_call_id": item["call_id"], "content": text_content(item.get("output"))})
-        elif kind == "reasoning":
-            # Qoder has no OpenAI encrypted reasoning state. The full text/tool
-            # history still travels with each stateless request.
+            text, images = split_images(item.get("output"))
+            if item["call_id"] in transcript_calls:
+                header = f"[Tool result ({item['call_id']})]\n" + text
+                push({"role": "user", "content": [{"type": "text", "text": header}] + images if images else header})
+                continue
+            if images:
+                text += ("\n" if text else "") + f"[{len(images)} image(s) attached in the next user message]"
+                tool_images.extend(images)
+            push({"role": "tool", "tool_call_id": item["call_id"], "content": text})
+        elif kind in ("reasoning", "compaction", "item_reference") or kind in HOSTED_CALL_ITEMS:
+            # Qoder has no OpenAI encrypted reasoning/compaction state, and this
+            # endpoint stores nothing to reference. The full text/tool history
+            # still travels with each stateless request.
             continue
         else:
             raise HTTPException(400, detail=f"Unsupported Responses input item type: {kind}")
+    flush_images()
     if not messages:
         raise HTTPException(400, detail="At least one input message or tool output is required")
     chat = {"model": payload.get("model", "gfmodel"), "messages": messages, "tools": tools.definitions, "stream": bool(payload.get("stream"))}
